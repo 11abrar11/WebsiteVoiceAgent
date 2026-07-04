@@ -1,0 +1,8 @@
+# PP5 Media Solutions - robots.txt
+# Allow all crawlers including search engines and LLM bots
+
+User-agent: *
+Allow: /
+
+# Sitemap location
+Sitemap: https://www.pp5mediasolutions.com/sitemap.xml

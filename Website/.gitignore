@@ -1,0 +1,40 @@
+node_modules
+dist
+.DS_Store
+server/public
+vite.config.ts.*
+*.tar.gz
+.env
+*.env.local
+
+# Large source/working files that exceed GitHub's 100MB limit
+*.psd
+*.ai
+*.fla
+*.mov
+*.avi
+*.zip
+
+# Block standard files if they are in these specific root folders
+Banner Ads/
+E-blast/
+Flyer/
+Magazine Work/
+Packaging/
+Social_Posts/
+Video/
+New_Samples/
+attached_assets/
+
+# ALWAYS allow optimized assets for the website
+!client/public/**/*.mp4
+!client/public/**/*.pdf
+!client/public/**/*.gif
+!client/public/**/*.jpg
+!client/public/**/*.png
+!client/public/**/*.webp
+.local/
+.replit
+_archive/
+client/public/portfolio/thumbnails/
+push-to-github.bat
