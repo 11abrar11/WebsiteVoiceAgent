@@ -10,6 +10,10 @@ from app.models.admin import Admin
 from app.repositories.conversation_repo import ConversationRepository
 from app.repositories.meeting_repo import MeetingRepository
 from app.services.auth_service import get_current_admin
+from app.models.lead import Lead
+from app.models.conversation import Conversation
+from app.models.meeting import Meeting, MeetingStatus
+from sqlalchemy import select, func
 
 router = APIRouter()
 
@@ -140,4 +144,138 @@ async def list_meetings(
             }
             for m in meetings
         ],
+    }
+
+
+@router.get("/metrics")
+async def get_dashboard_metrics(
+    session: AsyncSession = Depends(get_session),
+    admin: Admin = Depends(get_current_admin),
+):
+    """Get high-level CRM metrics."""
+    total_leads = await session.scalar(select(func.count(Lead.id))) or 0
+    qualified_leads = await session.scalar(select(func.count(Lead.id)).where(Lead.lead_score >= 50)) or 0
+    
+    meetings_booked = await session.scalar(select(func.count(Meeting.id))) or 0
+    upcoming_meetings = await session.scalar(select(func.count(Meeting.id)).where(Meeting.status == MeetingStatus.Confirmed)) or 0
+    
+    avg_score = await session.scalar(select(func.avg(Lead.lead_score))) or 0
+    avg_completeness = await session.scalar(select(func.avg(Lead.data_completeness))) or 0
+
+    return {
+        "total_leads": total_leads,
+        "qualified_leads": qualified_leads,
+        "meetings_booked": meetings_booked,
+        "upcoming_meetings": upcoming_meetings,
+        "average_lead_score": round(float(avg_score), 1),
+        "average_data_completeness": round(float(avg_completeness) * 100, 1),
+    }
+
+
+@router.get("/leads")
+async def list_leads(
+    limit: int = Query(default=20, le=100),
+    offset: int = Query(default=0, ge=0),
+    search: str = Query(default=None),
+    status: str = Query(default=None),
+    session: AsyncSession = Depends(get_session),
+    admin: Admin = Depends(get_current_admin),
+):
+    """Get a paginated list of leads for the CRM view."""
+    repo = ConversationRepository(session)
+    leads = await repo.get_all_leads(limit=limit, offset=offset, search=search, status=status)
+    total = await repo.count_leads(search=search, status=status)
+
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "leads": [
+            {
+                "id": l.id,
+                "name": l.name,
+                "email": l.email,
+                "company": l.company,
+                "industry": l.industry,
+                "lead_score": l.lead_score,
+                "lead_status": l.lead_status,
+                "data_completeness": l.data_completeness,
+                "conversation_count": len(l.conversations),
+                "meeting_count": len(l.meetings),
+                "last_interaction": l.updated_at.isoformat() if l.updated_at else None,
+                "created_at": l.created_at.isoformat() if l.created_at else None,
+            }
+            for l in leads
+        ],
+    }
+
+
+@router.get("/leads/{lead_id}")
+async def get_lead_detail(
+    lead_id: int,
+    session: AsyncSession = Depends(get_session),
+    admin: Admin = Depends(get_current_admin),
+):
+    """Get full CRM details of a single lead."""
+    repo = ConversationRepository(session)
+    lead = await repo.get_lead_details(lead_id)
+
+    if not lead:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    # Generate a concatenated business summary from their latest conversations
+    # For a real app, this could be an LLM call over all summaries, but for now we concatenate
+    all_summaries = [c.summary.summary for c in sorted(lead.conversations, key=lambda x: x.started_at, reverse=True) if c.summary]
+    business_summary = "\\n\\n".join(all_summaries) if all_summaries else "No business summary available yet."
+
+    return {
+        "id": lead.id,
+        "email": lead.email,
+        "name": lead.name,
+        "phone": lead.phone,
+        "company": lead.company,
+        "industry": lead.industry,
+        "requirement": lead.requirement,
+        "monthly_leads": lead.monthly_leads,
+        "company_size": lead.company_size,
+        "budget": lead.budget,
+        "timeline": lead.timeline,
+        "decision_maker": lead.decision_maker,
+        "lead_score": lead.lead_score,
+        "lead_status": lead.lead_status,
+        "data_completeness": lead.data_completeness,
+        "created_at": lead.created_at.isoformat() if lead.created_at else None,
+        "updated_at": lead.updated_at.isoformat() if lead.updated_at else None,
+        "business_summary": business_summary,
+        "conversations": [
+            {
+                "id": c.id,
+                "started_at": c.started_at.isoformat() if c.started_at else None,
+                "ended_at": c.ended_at.isoformat() if c.ended_at else None,
+                "status": c.status.value if c.status else None,
+                "duration_seconds": c.duration_seconds,
+                "model_used": c.model_used,
+                "summary": c.summary.summary if c.summary else None,
+                "messages": [
+                    {
+                        "speaker": m.speaker,
+                        "content": m.content,
+                        "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+                    }
+                    for m in sorted(c.messages, key=lambda x: x.timestamp)
+                ]
+            }
+            for c in sorted(lead.conversations, key=lambda x: x.started_at, reverse=True)
+        ],
+        "meetings": [
+            {
+                "id": m.id,
+                "date": m.date.isoformat() if m.date else None,
+                "time": m.time.isoformat() if m.time else None,
+                "status": m.status.value if m.status else None,
+                "notes": m.notes,
+            }
+            for m in sorted(lead.meetings, key=lambda x: (x.date, x.time), reverse=True)
+        ]
     }

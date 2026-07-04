@@ -72,17 +72,28 @@ class ConversationRepository:
             return None
 
         for k, v in data.items():
-            if hasattr(lead, k) and v is not None:
-                setattr(lead, k, v)
+            if hasattr(lead, k):
+                # Do not overwrite with empty strings from the LLM
+                if v is not None and v != "":
+                    setattr(lead, k, v)
 
-        # Recalculate data completeness
+        # Recalculate data completeness and lead score
         profile_fields = [
             "name", "phone", "company", "industry", "requirement",
             "monthly_leads", "company_size", "budget", "timeline",
             "decision_maker",
         ]
-        filled = sum(1 for f in profile_fields if getattr(lead, f, None))
+        
+        filled = 0
+        score = 0
+        for f in profile_fields:
+            val = getattr(lead, f, None)
+            if val:
+                filled += 1
+                score += 10  # 10 points for each filled field
+
         lead.data_completeness = round(filled / len(profile_fields), 2)
+        lead.lead_score = score
 
         await self.session.commit()
         await self.session.refresh(lead)
@@ -209,3 +220,57 @@ class ConversationRepository:
             select(func.count(Conversation.id))
         )
         return result.scalar()
+
+    # ── CRM / Lead-Centric operations ─────────────────────────────────
+
+    async def get_all_leads(self, limit: int = 50, offset: int = 0, search: str = None, status: str = None):
+        """Get a paginated list of leads with their relationships for stat computation."""
+        stmt = select(Lead).options(
+            selectinload(Lead.conversations),
+            selectinload(Lead.meetings)
+        )
+        
+        if search:
+            search_pattern = f"%{search}%"
+            stmt = stmt.where(
+                (Lead.name.ilike(search_pattern)) | 
+                (Lead.email.ilike(search_pattern)) | 
+                (Lead.company.ilike(search_pattern))
+            )
+            
+        if status:
+            stmt = stmt.where(Lead.lead_status == status)
+            
+        stmt = stmt.order_by(Lead.updated_at.desc()).limit(limit).offset(offset)
+        
+        result = await self.session.execute(stmt)
+        return result.scalars().all()
+
+    async def count_leads(self, search: str = None, status: str = None) -> int:
+        """Count leads for pagination."""
+        stmt = select(func.count(Lead.id))
+        
+        if search:
+            search_pattern = f"%{search}%"
+            stmt = stmt.where(
+                (Lead.name.ilike(search_pattern)) | 
+                (Lead.email.ilike(search_pattern)) | 
+                (Lead.company.ilike(search_pattern))
+            )
+            
+        if status:
+            stmt = stmt.where(Lead.lead_status == status)
+            
+        result = await self.session.execute(stmt)
+        return result.scalar()
+
+    async def get_lead_details(self, lead_id: int):
+        """Get a single lead with all conversations and meetings for CRM view."""
+        stmt = select(Lead).options(
+            selectinload(Lead.conversations).selectinload(Conversation.summary),
+            selectinload(Lead.conversations).selectinload(Conversation.messages),
+            selectinload(Lead.meetings)
+        ).where(Lead.id == lead_id)
+        
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()

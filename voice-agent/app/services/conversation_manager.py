@@ -277,7 +277,7 @@ class ConversationManager:
             asyncio.create_task(self._persist_message("user", text))
             
             t0 = time.perf_counter()
-            context = await asyncio.to_thread(rag_retriever.retrieve, text, 3)
+            context = await asyncio.to_thread(rag_retriever.retrieve, text, 2)
             self.metrics["rag_latency"] = time.perf_counter() - t0
             print("Successfully retrieved RAG context.")
             
@@ -289,8 +289,8 @@ class ConversationManager:
                 f"--- START CONTEXT ---\n{context}\n--- END CONTEXT ---\n"
             )
 
-            # Keep the last 20 messages (10 turns) to prevent token explosion
-            recent_history = self.chat_history[-20:] if len(self.chat_history) > 20 else self.chat_history
+            # Keep the last 10 messages (5 turns) to aggressively prevent token explosion
+            recent_history = self.chat_history[-10:] if len(self.chat_history) > 10 else self.chat_history
             messages = [{"role": "system", "content": prompt}] + recent_history
 
             async def combined_stream_gen():
