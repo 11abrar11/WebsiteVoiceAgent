@@ -157,7 +157,7 @@ async def get_dashboard_metrics(
     qualified_leads = await session.scalar(select(func.count(Lead.id)).where(Lead.lead_score >= 50)) or 0
     
     meetings_booked = await session.scalar(select(func.count(Meeting.id))) or 0
-    upcoming_meetings = await session.scalar(select(func.count(Meeting.id)).where(Meeting.status == MeetingStatus.Confirmed)) or 0
+    upcoming_meetings = await session.scalar(select(func.count(Meeting.id)).where(Meeting.status == MeetingStatus.CONFIRMED)) or 0
     
     avg_score = await session.scalar(select(func.avg(Lead.lead_score))) or 0
     avg_completeness = await session.scalar(select(func.avg(Lead.data_completeness))) or 0
