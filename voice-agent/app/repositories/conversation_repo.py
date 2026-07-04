@@ -95,6 +95,13 @@ class ConversationRepository:
         lead.data_completeness = round(filled / len(profile_fields), 2)
         lead.lead_score = score
 
+        if score >= 70:
+            lead.lead_status = "Hot"
+        elif score >= 40:
+            lead.lead_status = "Warm"
+        else:
+            lead.lead_status = "Cold"
+
         await self.session.commit()
         await self.session.refresh(lead)
         return lead

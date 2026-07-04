@@ -361,7 +361,7 @@ function LeadDetailView({ leadId, onBack }: { leadId: number; onBack: () => void
             <p className="text-gray-200">{(lead.data_completeness ?? 0) * 100}%</p>
           </div>
           <div className="col-span-2 md:col-span-4">
-            <span className="text-gray-500 text-xs uppercase tracking-wider font-semibold block mb-1">Requirement</span>
+            <span className="text-gray-500 text-xs uppercase tracking-wider font-semibold block mb-1">Projects / Requirements</span>
             <p className="text-gray-200 bg-[#1a1a1a] p-3 rounded-lg border border-[#222]">{lead.requirement || "No specific requirements captured yet."}</p>
           </div>
         </div>
