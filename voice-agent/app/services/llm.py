@@ -9,8 +9,8 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 class LLMService:
     def __init__(self):
         self.client = AsyncGroq(api_key=GROQ_API_KEY)
-        # Using llama-3.3-70b-versatile as requested
-        self.model = "llama-3.3-70b-versatile"
+        # Using llama3-8b-8192 to bypass the rate limit exhaustion on the 70B model
+        self.model = "llama3-8b-8192"
 
     async def generate_response(self, system_prompt: str, chat_history: list) -> str:
         """
