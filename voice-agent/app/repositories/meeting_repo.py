@@ -3,7 +3,7 @@ Repository for meeting slot management and booking.
 Meetings are linked to leads (not conversations).
 """
 from datetime import date, time, datetime, timezone
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.meeting import Meeting, MeetingStatus
@@ -101,3 +101,60 @@ class MeetingRepository:
             .offset(offset)
         )
         return result.scalars().all()
+
+    # ── Policy Engine Support ─────────────────────────────────────────
+
+    async def get_active_meeting_for_lead(self, lead_id: int) -> Meeting | None:
+        """
+        Get the active meeting (Reserved or Confirmed) for a lead.
+        Returns None if no active meeting exists.
+        Used by MeetingPolicy to enforce one-active-meeting-per-lead.
+        """
+        result = await self.session.execute(
+            select(Meeting).where(
+                and_(
+                    Meeting.lead_id == lead_id,
+                    Meeting.status.in_([
+                        MeetingStatus.RESERVED,
+                        MeetingStatus.CONFIRMED,
+                    ]),
+                )
+            ).order_by(Meeting.date.desc(), Meeting.time.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def cancel_meeting(self, meeting_id: int) -> bool:
+        """
+        Cancel a meeting by ID. Sets status to Rescheduled.
+        Returns True if successfully cancelled.
+        """
+        result = await self.session.execute(
+            select(Meeting).where(Meeting.id == meeting_id)
+        )
+        meeting = result.scalar_one_or_none()
+        if not meeting:
+            return False
+
+        meeting.status = MeetingStatus.RESCHEDULED
+        meeting.updated_at = datetime.now(timezone.utc)
+        await self.session.commit()
+        return True
+
+    async def count_past_meetings_for_lead(self, lead_id: int) -> int:
+        """Count completed/cancelled/rescheduled meetings for analytics."""
+        result = await self.session.execute(
+            select(func.count(Meeting.id)).where(
+                and_(
+                    Meeting.lead_id == lead_id,
+                    Meeting.status.in_([
+                        MeetingStatus.COMPLETED,
+                        MeetingStatus.CANCELLED,
+                        MeetingStatus.RESCHEDULED,
+                        MeetingStatus.NO_SHOW,
+                    ]),
+                )
+            )
+        )
+        return result.scalar() or 0
+

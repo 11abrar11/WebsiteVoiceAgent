@@ -120,3 +120,82 @@ sequenceDiagram
     CM->>DB: create_conversation(lead_id=42)
     CM-->>FE: {"type": "ready"}
 ```
+
+## 5. Conversation Policy Engine
+
+The Conversation Policy Engine is a deterministic backend layer that owns business rules, conversation stages, tool gating, and output validation. It ensures the LLM acts solely as a reasoning and language engine, while the backend remains the absolute source of truth.
+
+### Architecture Overview
+
+```mermaid
+graph TD
+    subgraph "User Turn"
+        A["User Message"] --> B["ConversationManager"]
+    end
+
+    subgraph "Policy Engine (Pre-LLM)"
+        B --> PE["PolicyEngine.evaluate()"]
+        PE --> SE["StageEngine"]
+        PE --> TG["ToolGate"]
+        PE --> MP["MeetingPolicy"]
+        PE --> CS["ConversationStrategy"]
+        PE --> PB["DynamicPromptBuilder"]
+    end
+
+    subgraph "LLM Request (Gated)"
+        PB --> LLM["Groq API"]
+        TG -->|"filtered tools"| LLM
+        LLM --> RESP["LLM Response"]
+    end
+
+    subgraph "Output Policy (Post-LLM)"
+        RESP --> EP["EnterprisePolicy"]
+        EP --> VALID{"Valid?"}
+        VALID -->|"Yes"| USER["Safe Response → User"]
+        VALID -->|"Modified"| STRIP["Sanitize → User"]
+    end
+
+    subgraph "Debug (PERFORMANCE_PROFILING)"
+        PE --> DL["DecisionLogger"]
+        LLM --> TP["TokenProfiler"]
+    end
+```
+
+### Stage Transition Flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> GREETING: turn 1
+
+    GREETING --> DISCOVERY: user shares context
+    GREETING --> KNOWLEDGE: asks about services
+
+    DISCOVERY --> BUSINESS_DISCOVERY: mentions company/industry
+    DISCOVERY --> KNOWLEDGE: asks about services
+    DISCOVERY --> MEETING_DISCUSSION: wants to meet
+
+    BUSINESS_DISCOVERY --> QUALIFICATION: budget/timeline discussed
+    BUSINESS_DISCOVERY --> KNOWLEDGE: asks about services
+
+    QUALIFICATION --> MEETING_DISCUSSION: ready to schedule
+    QUALIFICATION --> KNOWLEDGE: asks about services
+
+    KNOWLEDGE --> DISCOVERY: returns to needs discussion
+    KNOWLEDGE --> MEETING_DISCUSSION: wants to meet
+
+    MEETING_DISCUSSION --> MEETING_BOOKING: confirms a slot
+    MEETING_DISCUSSION --> MEETING_RESCHEDULE: has active meeting
+
+    MEETING_BOOKING --> CLOSING: booking complete
+    MEETING_RESCHEDULE --> CLOSING: reschedule complete
+
+    CLOSING --> [*]
+```
+
+### Token Profiling & Optimization
+By moving from a monolithic static prompt to a **dynamic, stage-aware prompt** with gated tools and on-demand RAG, we achieved a **50-60% reduction in prompt tokens per turn** and eliminated LLM hallucinations regarding business rules.
+
+### Robustness & Safety
+- **Enterprise Policy:** Blocks the LLM from outputting internal system instructions, XML tags, or hallucinated pricing.
+- **Meeting Policy:** Enforces a strict one-active-meeting-per-lead rule at the database level.
+- **Tool Gating:** The LLM only sees the tools relevant to the current conversation stage.

@@ -10,7 +10,9 @@ from app.database.connection import AsyncSessionLocal
 from app.repositories.conversation_repo import ConversationRepository
 from app.repositories.meeting_repo import MeetingRepository
 from app.meeting.engine import MeetingEngine
-from app.tools.tools import TOOL_DEFINITIONS
+from app.policy.engine import PolicyEngine
+from app.policy.stage_engine import ConversationStage
+from app.services.lead_state import LeadStateManager
 import base64
 import re
 import time
@@ -27,38 +29,25 @@ class ConversationManager:
         self.current_task = None
         self.conversation_id = None
         self.returning_context = ""
-        self.system_prompt = (
-            "You are an experienced, premium business consultant for PP5 Media Solutions. You are on a live voice call with a potential client.\n"
-            "YOUR CORE OBJECTIVES:\n"
-            "1. Build rapport and understand the user's business goals and pain points.\n"
-            "2. Discuss how PP5 Media Solutions can help them, using the provided knowledge base context.\n"
-            "3. Suggest scheduling a meeting with our team once you understand their needs.\n"
-            "CONVERSATION STYLE & TONE:\n"
-            "- Be warm, confident, curious, and professional. \n"
-            "- Speak exactly like a human consultant (use contractions like \"we're\", \"it's\").\n"
-            "- Keep responses concise (1-3 short sentences). Use commas for natural breathing pauses.\n"
-            "- NEVER sound like a checklist or a web form. Do not ask procedural questions back-to-back.\n"
-            "LEAD COLLECTION STRATEGY:\n"
-            "- Do NOT immediately ask for name, email, phone, or company.\n"
-            "- Gather information naturally during the conversation. \n"
-            "- ONLY ask for contact info when it logically fits (e.g., asking for an email to send a proposal, or asking for a name so you know who you are speaking with).\n"
-            "- If the user has already provided a piece of information, NEVER ask for it again. Use it naturally in conversation.\n"
-            "TOOL EXECUTION (SILENT BACKGROUND ACTIONS):\n"
-            "- You have access to tools (extract_lead_info, get_available_meeting_times, book_meeting).\n"
-            "- Execute tools SILENTLY. NEVER mention to the user that you are using a tool, updating a database, saving their info, or checking a system. \n"
-            "- Example: If the user says \"My name is Mohammed\", call extract_lead_info and reply smoothly: \"Nice to meet you, Mohammed. What kind of project are you looking to build?\"\n"
-            "- NEVER say \"I have updated your name\" or \"I've saved your email\".\n"
-            "IDENTITY & CONSTRAINTS:\n"
-            "- You are an unnamed AI voice consultant. Do not adopt a human name.\n"
-            "- Do not output any markdown formatting, XML, JSON, or code in your speech.\n"
-            "- Protect proprietary company secrets.\n"
-        )
+
+        # ── Policy Engine (source of truth for all business decisions) ──
+        self.policy_engine = PolicyEngine()
+        self.current_stage = ConversationStage.GREETING
+        self.turn_count = 0
+        self.turns_since_last_extraction = 0
+        self.rag_invoked_this_turn = False
+
+        # ── LeadStateManager ──
+        self.lead_state = LeadStateManager(lead_id)
 
     async def initialize_persistence(self):
         """Create a conversation record and load returning-user context."""
         try:
             # Build returning-user context via ContextBuilder
             self.returning_context = await context_builder.build(self.lead_id)
+
+            # Load lead state from database
+            await self.lead_state.load_from_db()
 
             if self.lead_id:
                 async with AsyncSessionLocal() as session:
@@ -97,6 +86,9 @@ class ConversationManager:
             return
 
         try:
+            # Commit any pending lead state changes
+            await self.lead_state.commit()
+
             async with AsyncSessionLocal() as session:
                 repo = ConversationRepository(session)
                 # Count user and assistant messages in chat_history
@@ -177,7 +169,7 @@ class ConversationManager:
         self._reset_metrics()
         await self._process_text_and_respond(text, return_audio=False)
 
-    async def _handle_tool_calls(self, tool_calls):
+    async def _handle_tool_calls(self, tool_calls, policy_decision):
         """Execute tool calls from the LLM and return the results as messages."""
         results = []
         for tc in tool_calls:
@@ -192,6 +184,19 @@ class ConversationManager:
             except json.JSONDecodeError:
                 args = {}
 
+            # ── Enterprise Policy: Validate tool call ─────────────────
+            is_allowed, reason = self.policy_engine.validate_tool_call(
+                func_name, args, policy_decision.allowed_tool_names,
+            )
+            if not is_allowed:
+                print(f">>> BLOCKED tool call: {func_name} -- {reason}")
+                results.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": json.dumps({"error": reason}),
+                })
+                continue
+
             print(f">>> Tool call: {func_name}({args})")
 
             if func_name == "get_available_meeting_times":
@@ -199,60 +204,113 @@ class ConversationManager:
                     meeting_repo = MeetingRepository(session)
                     engine = MeetingEngine(meeting_repo)
                     slots = await engine.get_available_times()
-                result_content = json.dumps(slots)
 
-            elif func_name == "book_meeting":
+                # Format as concise human-readable text (token optimization)
+                if slots:
+                    slot_lines = []
+                    current_date = None
+                    for s in slots:
+                        if s["date"] != current_date:
+                            current_date = s["date"]
+                            slot_lines.append(f"\n{s['day']} {s['date']}:")
+                        slot_lines.append(f"  {s['time']}")
+                    result_content = "Available meeting times:" + "".join(slot_lines)
+                else:
+                    result_content = "No available meeting times found."
+
+            elif func_name == "confirm_meeting_slot":
+                # ── Unified meeting intent: backend decides book vs reschedule ──
                 if self.lead_id:
-                    async with AsyncSessionLocal() as session:
-                        meeting_repo = MeetingRepository(session)
-                        engine = MeetingEngine(meeting_repo)
-                        meeting = await engine.book(
-                            date_str=args["date"],
-                            time_str=args["time"],
-                            lead_id=self.lead_id,
-                        )
-                    if meeting:
-                        # Look up lead email for the notification
-                        lead_email = "Unknown"
-                        if self.lead_id:
-                            async with AsyncSessionLocal() as session:
-                                repo = ConversationRepository(session)
-                                lead = await repo.get_lead(self.lead_id)
-                                if lead:
-                                    lead_email = lead.email
+                    meeting_pol = policy_decision.meeting_policy
 
-                        from app.email.sender import send_meeting_email
-                        asyncio.create_task(send_meeting_email(
-                            args["date"], args["time"], lead_email, "Booked via AI Voice Agent"
-                        ))
-                        result_content = json.dumps({
-                            "success": True,
-                            "message": f"Meeting booked for {args['date']} at {args['time']}",
-                        })
+                    if meeting_pol.should_reschedule and meeting_pol.active_meeting_id:
+                        # Reschedule flow: cancel old + book new
+                        async with AsyncSessionLocal() as session:
+                            meeting_repo = MeetingRepository(session)
+                            engine = MeetingEngine(meeting_repo)
+                            meeting = await engine.reschedule(
+                                old_meeting_id=meeting_pol.active_meeting_id,
+                                new_date_str=args["date"],
+                                new_time_str=args["time"],
+                                lead_id=self.lead_id,
+                            )
+                        if meeting:
+                            result_content = json.dumps({
+                                "success": True,
+                                "message": f"Meeting rescheduled to {args['date']} at {args['time']}",
+                                "action": "rescheduled",
+                            })
+                        else:
+                            result_content = json.dumps({
+                                "success": False,
+                                "message": "That slot is no longer available. Please try another time.",
+                            })
                     else:
-                        result_content = json.dumps({
-                            "success": False,
-                            "message": "That slot is no longer available. Please try another time.",
-                        })
+                        # New booking flow
+                        async with AsyncSessionLocal() as session:
+                            meeting_repo = MeetingRepository(session)
+                            engine = MeetingEngine(meeting_repo)
+                            meeting = await engine.book(
+                                date_str=args["date"],
+                                time_str=args["time"],
+                                lead_id=self.lead_id,
+                            )
+                        if meeting:
+                            # Look up lead email for the notification
+                            lead_email = "Unknown"
+                            if self.lead_id:
+                                async with AsyncSessionLocal() as session:
+                                    repo = ConversationRepository(session)
+                                    lead = await repo.get_lead(self.lead_id)
+                                    if lead:
+                                        lead_email = lead.email
+
+                            from app.email.sender import send_meeting_email
+                            asyncio.create_task(send_meeting_email(
+                                args["date"], args["time"], lead_email, "Booked via AI Voice Agent"
+                            ))
+                            result_content = json.dumps({
+                                "success": True,
+                                "message": f"Meeting booked for {args['date']} at {args['time']}",
+                                "action": "booked",
+                            })
+                        else:
+                            result_content = json.dumps({
+                                "success": False,
+                                "message": "That slot is no longer available. Please try another time.",
+                            })
                 else:
                     result_content = json.dumps({
                         "success": False,
-                        "message": "Cannot book meeting – no active lead.",
+                        "message": "Cannot manage meeting - no active lead.",
                     })
+
             elif func_name == "extract_lead_info":
                 if self.lead_id:
-                    # RATIONALE: We intentionally keep this database write synchronous.
-                    # While making it asynchronous via asyncio.create_task() would reduce latency, 
-                    # a synchronous write ensures strict data consistency, preventing 
-                    # silent failures where the AI thinks the data was saved but the DB transaction fails.
-                    # Future Enhancement: We could implement a durable transactional outbox or Redis queue
-                    # to achieve low-latency without sacrificing consistency guarantees.
-                    async with AsyncSessionLocal() as session:
-                        repo = ConversationRepository(session)
-                        await repo.update_lead(self.lead_id, args)
-                    result_content = json.dumps({"success": True, "message": "Lead info updated successfully."})
+                    # Update in-memory lead state
+                    self.lead_state.update_extracted_info(args)
+                    self.turns_since_last_extraction = 0
+
+                    # Commit to database
+                    await self.lead_state.commit()
+
+                    result_content = json.dumps({"success": True, "message": "Lead info updated."})
                 else:
-                    result_content = json.dumps({"success": False, "message": "Cannot update lead - no active lead."})
+                    result_content = json.dumps({"success": False, "message": "No active lead."})
+
+            elif func_name == "search_knowledge_base":
+                # ── Dynamic RAG: only invoked when the tool is called ──
+                query = args.get("query", "")
+                t_rag = time.perf_counter()
+                context = await asyncio.to_thread(rag_retriever.retrieve, query, 2)
+                self.metrics["rag_latency"] = time.perf_counter() - t_rag
+                self.rag_invoked_this_turn = True
+
+                if PERFORMANCE_PROFILING:
+                    self.policy_engine.token_profiler.set_num_retrieved_docs(2)
+
+                result_content = context  # Plain text, not JSON
+
             else:
                 result_content = json.dumps({"error": f"Unknown tool: {func_name}"})
 
@@ -267,6 +325,9 @@ class ConversationManager:
     async def _process_text_and_respond(self, text: str, return_audio: bool):
         print(f"User says: {text}")
         self.is_interrupted = False
+        self.rag_invoked_this_turn = False
+        self.turn_count += 1
+        self.turns_since_last_extraction += 1
         
         try:
             if return_audio:
@@ -276,39 +337,62 @@ class ConversationManager:
             # Persist user message
             asyncio.create_task(self._persist_message("user", text))
             
-            t0 = time.perf_counter()
-            context = await asyncio.to_thread(rag_retriever.retrieve, text, 2)
-            self.metrics["rag_latency"] = time.perf_counter() - t0
-            print("Successfully retrieved RAG context.")
-            
-            # Build the full prompt with returning-user context (from ContextBuilder)
-            prompt = (
-                f"{self.system_prompt}\n\n"
-                f"{self.returning_context}\n"
-                f"Here are 3 relevant context chunks from our knowledge base:\n"
-                f"--- START CONTEXT ---\n{context}\n--- END CONTEXT ---\n"
+            # ── POLICY ENGINE: Evaluate all policies before LLM request ──
+            policy_decision = await self.policy_engine.evaluate(
+                user_message=text,
+                chat_history=self.chat_history,
+                lead_state=self.lead_state,
+                lead_id=self.lead_id,
+                current_stage=self.current_stage,
+                turn_count=self.turn_count,
+                returning_context=self.returning_context,
+                conversation_summary="",  # Summaries are in returning_context
+                turns_since_last_extraction=self.turns_since_last_extraction,
+                debug=PERFORMANCE_PROFILING,
             )
 
-            # Keep the last 10 messages (5 turns) to aggressively prevent token explosion
+            # Update conversation stage
+            self.current_stage = policy_decision.stage
+
+            # Log the decision in debug mode
+            if PERFORMANCE_PROFILING and policy_decision.decision_log:
+                print(self.policy_engine.decision_logger.format_log(
+                    policy_decision.decision_log
+                ))
+
+            # Build messages with the dynamic prompt (no RAG injected here)
             recent_history = self.chat_history[-10:] if len(self.chat_history) > 10 else self.chat_history
-            messages = [{"role": "system", "content": prompt}] + recent_history
+            messages = [{"role": "system", "content": policy_decision.system_prompt}] + recent_history
+
+            # Get the gated tools for this stage
+            allowed_tools = policy_decision.allowed_tools
 
             async def combined_stream_gen():
                 t_llm_start = time.perf_counter()
                 stream = await llm_service.client.chat.completions.create(
                     model=llm_service.model,
                     messages=messages,
-                    tools=TOOL_DEFINITIONS,
-                    tool_choice="auto",
+                    tools=allowed_tools if allowed_tools else None,
+                    tool_choice="auto" if allowed_tools else None,
                     temperature=0.7,
                     max_tokens=512,
                     stream=True,
                 )
                 
                 tool_calls = []
+                first_token_received = False
                 async for chunk in stream:
-                    if self.metrics["llm_ttft"] == 0.0:
+                    if not first_token_received:
                         self.metrics["llm_ttft"] = time.perf_counter() - t_llm_start
+                        first_token_received = True
+
+                        # Capture token usage from streaming (if available)
+                        if hasattr(chunk, 'x_groq') and chunk.x_groq and hasattr(chunk.x_groq, 'usage'):
+                            usage = chunk.x_groq.usage
+                            if PERFORMANCE_PROFILING and usage:
+                                self.policy_engine.token_profiler.set_api_usage(
+                                    usage.prompt_tokens, usage.completion_tokens
+                                )
                     
                     delta = chunk.choices[0].delta
                     if delta.tool_calls:
@@ -328,19 +412,26 @@ class ConversationManager:
                 if tool_calls:
                     self.chat_history.append({
                         "role": "assistant",
-                        "content": "",
+                        "content": None,
                         "tool_calls": tool_calls,
                     })
                     
                     t_tool_start = time.perf_counter()
-                    tool_results = await self._handle_tool_calls(tool_calls)
+                    tool_results = await self._handle_tool_calls(tool_calls, policy_decision)
                     self.metrics["tools_latency"] = time.perf_counter() - t_tool_start
+
+                    if PERFORMANCE_PROFILING:
+                        self.policy_engine.token_profiler.set_tool_exec_latency(
+                            self.metrics["tools_latency"] * 1000
+                        )
                     
                     for tr in tool_results:
                         self.chat_history.append(tr)
                     
+                    # Second LLM request (after tool execution)
+                    # No tools exposed on the follow-up — it's a pure response generation
                     recent_history = self.chat_history[-20:] if len(self.chat_history) > 20 else self.chat_history
-                    new_messages = [{"role": "system", "content": prompt}] + recent_history
+                    new_messages = [{"role": "system", "content": policy_decision.system_prompt}] + recent_history
                     t_second_llm_start = time.perf_counter()
                     print(f"[{time.time():.4f}] [TRACE] Second LLM Request Begins")
                     new_stream = await llm_service.client.chat.completions.create(
@@ -360,8 +451,13 @@ class ConversationManager:
                 
                 self.metrics["llm_total"] += time.perf_counter() - t_llm_start
 
+                if PERFORMANCE_PROFILING:
+                    self.policy_engine.token_profiler.set_llm_latency(
+                        self.metrics["llm_total"] * 1000
+                    )
+
             print("Generating streamed LLM response...")
-            await self._stream_and_send(combined_stream_gen(), return_audio)
+            await self._stream_and_send(combined_stream_gen(), return_audio, policy_decision)
             
         except Exception as e:
             import traceback
@@ -395,7 +491,7 @@ class ConversationManager:
         except Exception as e:
             print(f">>> Error in stream_and_synthesize: {e}")
 
-    async def _stream_and_send(self, stream_gen, return_audio: bool):
+    async def _stream_and_send(self, stream_gen, return_audio: bool, policy_decision=None):
         """Core streaming + TTS synthesis + WebSocket send logic."""
         full_response = ""
         current_buffer = ""
@@ -478,7 +574,27 @@ class ConversationManager:
             
         await audio_queue.put(None)
         await worker_task
-        
+
+        # ── OUTPUT POLICY: Validate the response before sending ──────
+        if full_response and policy_decision:
+            validation = self.policy_engine.validate_output(
+                full_response,
+                rag_was_invoked=self.rag_invoked_this_turn,
+            )
+
+            if validation.was_modified:
+                print(f">>> Output validation modified response. Violations: {validation.violations}")
+                full_response = validation.sanitized_response
+
+            # Update decision log with validation result
+            if PERFORMANCE_PROFILING and policy_decision.decision_log:
+                self.policy_engine.decision_logger.update_output_validation(
+                    policy_decision.decision_log, validation,
+                )
+                # Re-print the updated log section
+                if validation.violations:
+                    print(f">>> Output Violations: {validation.violations}")
+
         if not self.is_interrupted:
             await self.websocket.send_json({"type": "response_complete", "text": full_response})
         
@@ -488,6 +604,7 @@ class ConversationManager:
             asyncio.create_task(self._persist_message("assistant", full_response))
         print(f"Finished response. Interrupted: {self.is_interrupted}")
         
+        # ── Performance + Token Profiler Report ──────────────────────
         if PERFORMANCE_PROFILING and not self.is_interrupted:
             total_time = time.perf_counter() - self.metrics["start_time"]
             db_metrics = sql_metrics.get()
@@ -504,4 +621,9 @@ class ConversationManager:
             print(f" SQL Transactions:     {db_metrics['transactions']}")
             print(f" TTS Total Latency:    {self.metrics.get('tts_latency', 0.0)*1000:.2f} ms")
             print(f" End-to-End Latency:   {total_time*1000:.2f} ms")
-            print("="*50 + "\n")
+            print(f" Conversation Stage:   {self.current_stage.value}")
+            print("="*50)
+
+            # Token Profiler
+            report = self.policy_engine.token_profiler.generate_report()
+            print(self.policy_engine.token_profiler.format_report(report))

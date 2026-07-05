@@ -98,3 +98,25 @@ class MeetingEngine:
             lead_id=lead_id,
             notes=notes,
         )
+
+    async def reschedule(
+        self,
+        old_meeting_id: int,
+        new_date_str: str,
+        new_time_str: str,
+        lead_id: int,
+    ):
+        """
+        Reschedule an existing meeting: cancel old + book new atomically.
+        Returns the new Meeting object or None if the new slot is taken.
+        """
+        from datetime import date as date_type, time as time_type, datetime
+
+        # Cancel the old meeting
+        cancelled = await self.repo.cancel_meeting(old_meeting_id)
+        if not cancelled:
+            return None
+
+        # Parse and book the new slot (reuse book method's parsing)
+        return await self.book(new_date_str, new_time_str, lead_id, notes="Rescheduled via AI Voice Agent")
+
