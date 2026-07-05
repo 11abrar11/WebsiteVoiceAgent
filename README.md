@@ -76,7 +76,7 @@ erDiagram
 
     CONVERSATION_SUMMARIES {
         int id PK
-        int conversation_id FK UK
+        int conversation_id FK, UK
         text summary
         int summary_version
         string summary_model
